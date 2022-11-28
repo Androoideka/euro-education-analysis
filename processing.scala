@@ -19,6 +19,8 @@ import org.apache.spark.sql.functions.concat
 import org.apache.spark.sql.functions.row_number
 import org.apache.spark.sql.functions.first
 import org.apache.spark.sql.functions.map
+import org.apache.spark.sql.functions.to_timestamp
+import org.apache.spark.sql.functions.year
 import org.apache.spark.sql.expressions.Window
 import scala.xml.XML
 
@@ -39,21 +41,40 @@ dbutils.fs.head(natalityFile)
 
 // COMMAND ----------
 
-val geoColumnType = StructField("indic_de,geo\time", StringType, nullable = false)
+val natalityCodesColumnType = StructField("indic_de,geo\time", StringType, nullable = false)
 
 val natalityYears = Range(2009, 2021, 1)
-val timeColumns = natalityYears.map(year => year.toString())
-val timeColumnTypes = timeColumns.map(column => StructField(column, StringType, nullable = false))
+val natalityTimeColumns = natalityYears.map(year => year.toString())
+val natalityTimeColumnTypes = natalityTimeColumns.map(column => StructField(column, StringType, nullable = false))
 
-val columnTypes = geoColumnType +: timeColumnTypes
-val schema = StructType(columnTypes)
+val natalityColumnTypes = natalityCodesColumnType +: natalityTimeColumnTypes
+val natalitySchema = StructType(natalityColumnTypes)
 
 val natalityInitialDF = spark.read.format("csv")
-                  .schema(schema)
+                  .schema(natalitySchema)
                   .option("delimiter", "\\t")
                   .option("header", true)
                   .load(natalityFile)
 display(natalityInitialDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Clean data - remove unnecessary row and remove non-numeric characters from values in year columns.
+
+// COMMAND ----------
+
+val natalityRemoveLastDF = natalityInitialDF.filter(natalityInitialDF("indic_de,geo\time") =!= "GBIRTHRT_THSP")
+var natalityNumbersDF = natalityRemoveLastDF
+
+for(i <- natalityYears) {
+  natalityNumbersDF = natalityNumbersDF.withColumn(i.toString + "number", regexp_replace(natalityNumbersDF(i.toString), ":", "0")).drop(i.toString)
+  natalityNumbersDF = natalityNumbersDF.withColumn(i.toString + "number", regexp_replace(natalityNumbersDF(i.toString + "number"), "[^0-9]", ""))
+  natalityNumbersDF = natalityNumbersDF.withColumn(i.toString, natalityNumbersDF(i.toString + "number").cast(IntegerType)).drop(i.toString + "number")
+}
+
+val natalityCleanDF = natalityNumbersDF
+display(natalityCleanDF)
 
 // COMMAND ----------
 
@@ -84,7 +105,7 @@ def getCodeMap(structureFile: String, language: String): Map[String, String] = {
 // COMMAND ----------
 
 val natalityStructureFile = "dbfs:/FileStore/tps00204_dsd.xml"
-val countryMap = getCodeMap(natalityStructureFile, "en")
+val natalityMap = getCodeMap(natalityStructureFile, "en")
 
 // COMMAND ----------
 
@@ -93,173 +114,312 @@ val countryMap = getCodeMap(natalityStructureFile, "en")
 
 // COMMAND ----------
 
-var natalityCountriesDF = natalityInitialDF.withColumn("Country", natalityInitialDF("indic_de,geo	ime"))
-for ((code, country) <- countryMap) {
-  natalityCountriesDF = natalityCountriesDF.withColumn("Country", regexp_replace(natalityCountriesDF("Country"), "^GBIRTHRT_THSP," + code + "$", country))
+var natalityTranslatedDF = natalityCleanDF.withColumnRenamed("indic_de,geo\time", "Country")
+
+for ((code, description) <- natalityMap) {
+  natalityTranslatedDF = natalityTranslatedDF.withColumn("Country", regexp_replace(natalityTranslatedDF("Country"), "^GBIRTHRT_THSP," + code + "$", description))
 }
-natalityCountriesDF = natalityCountriesDF.drop(natalityCountriesDF("indic_de,geo	ime"))
 
-display(natalityCountriesDF)
-
-// COMMAND ----------
-
-// MAGIC %md
-// MAGIC Remove unnecessary row and split EU subtotals into their own dataframe.
-
-// COMMAND ----------
-
-val natalityRemoveLastDF = natalityCountriesDF.filter(natalityCountriesDF("Country") =!= "GBIRTHRT_THSP")
-display(natalityRemoveLastDF)
-val natalityNoEuro = natalityRemoveLastDF.filter(!natalityRemoveLastDF("Country").contains("Euro"))
-val natalityOnlyEuro = natalityRemoveLastDF.filter(natalityRemoveLastDF("Country").contains("Euro"))
-display(natalityNoEuro)
+display(natalityTranslatedDF)
 
 // COMMAND ----------
 
 // MAGIC %md
-// MAGIC Check education level data (from https://data.europa.eu/data/datasets/2rdgenqayvidkf7nfm2g?locale=en) and identify columns.
+// MAGIC Clean once more - shorten EU grouping descriptions.
 
 // COMMAND ----------
 
-val educationFile = "dbfs:/FileStore/educ_uoe_enra03.tsv"
+val euroDescriptions= Array("Germany (until 1990 former territory of the FRG)", "European Union - 15 countries (1995-2004)", "Euro area - 18 countries (2014)", "Euro area - 19 countries  (from 2015)", "European Union - 27 countries (2007-2013)", "European Union - 27 countries (from 2020)", "European Union - 28 countries (2013-2020)")
+
+val euroTerms = Array("Germany", "EU15", "EU18", "EU19", "Old_EU27", "EU27", "EU28")
+
+val euroMap = euroDescriptions zip euroTerms
+
+var natalityOpaqueDF = natalityTranslatedDF
+for ((original, sub) <- euroMap) {
+  natalityOpaqueDF = natalityOpaqueDF.withColumn("Country", regexp_replace(natalityOpaqueDF("Country"), "\\Q" + original + "\\E", sub))
+}
+val natalityShortDF = natalityOpaqueDF
+
+display(natalityShortDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Separate measurements by year.
+
+// COMMAND ----------
+
+var natalityMapDF = natalityShortDF.withColumn("year_map", map(natalityYears.map(year => lit(year.toString) :: natalityShortDF(year.toString) :: Nil).flatten: _*))
+
+for (i <- natalityYears) {
+  natalityMapDF = natalityMapDF.drop(i.toString)
+}
+
+natalityMapDF = natalityMapDF.select(natalityMapDF("*"), explode(natalityMapDF("year_map")))
+natalityMapDF = natalityMapDF.withColumnRenamed("key", "Year").withColumnRenamed("value", "Births").drop("year_map")
+natalityMapDF = natalityMapDF.withColumn("Year", natalityMapDF("Year").cast(IntegerType))
+natalityMapDF.cache()
+display(natalityMapDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Check education attainment dataset (from https://data.europa.eu/data/datasets/rwtzczizukv1zv5bhatyg?locale=en) and identify columns.
+
+// COMMAND ----------
+
+val educationFile = "dbfs:/FileStore/edat_lfs_9911.tsv"
 dbutils.fs.head(educationFile)
 
 // COMMAND ----------
 
 // MAGIC %md
-// MAGIC Create schema and import dataset into Spark. (education level)
+// MAGIC Create schema and import dataset into Spark. (education attainment)
 
 // COMMAND ----------
 
-val geoColumnType = StructField("indic_ur,cities\time", StringType, nullable = false)
+val educationCodesColumnType = StructField("unit,sex,isced11,citizen,age,geo\time", StringType, nullable = false)
 
-val educationYears = Range(2012, 2020, 1)
-val timeColumns = educationYears.map(year => year.toString())
-val timeColumnTypes = timeColumns.map(column => StructField(column, StringType, nullable = false))
+val educationYears = Range(2004, 2021, 1)
+val educationTimeColumns = educationYears.map(year => year.toString())
+val educationTimeColumnTypes = educationTimeColumns.map(column => StructField(column, StringType, nullable = false))
 
-val columnTypes = geoColumnType +: timeColumnTypes
-val schema = StructType(columnTypes)
+val educationColumnTypes = educationCodesColumnType +: educationTimeColumnTypes
+val educationSchema = StructType(educationColumnTypes)
 
 val educationInitialDF = spark.read.format("csv")
-                  .schema(schema)
+                  .schema(educationSchema)
                   .option("delimiter", "\\t")
                   .option("header", true)
                   .load(educationFile)
+display(educationInitialDF)
 
 // COMMAND ----------
 
 // MAGIC %md
-// MAGIC Extract codes from EU education level XML structure file and map them to descriptions in English.
+// MAGIC Clean data - remove non-numeric characters from values in year columns and make an array out of codes.
 
 // COMMAND ----------
 
-val educationStructureFile = "dbfs:/FileStore/educ_uoe_enra03_dsd.xml"
-val educationMap = getCodeMap(educationStructureFile, "en")
+val educationSplitDF = educationInitialDF.withColumn("codes", split(educationInitialDF("unit,sex,isced11,citizen,age,geo\time"), ",")).drop("unit,sex,isced11,citizen,age,geo\time")
+var educationNumbersDF = educationSplitDF
 
-// COMMAND ----------
+for(i <- educationYears) {
+  educationNumbersDF = educationNumbersDF.withColumn(i.toString + "number", regexp_replace(educationNumbersDF(i.toString), ":", "0")).drop(i.toString)
+  educationNumbersDF = educationNumbersDF.withColumn(i.toString + "number", regexp_replace(educationNumbersDF(i.toString + "number"), raw"[^0-9\s.]+|\.(?!\d)", ""))
+  educationNumbersDF = educationNumbersDF.withColumn(i.toString, educationNumbersDF(i.toString + "number").cast(DoubleType)).drop(i.toString + "number")
+}
 
-// MAGIC %md
-// MAGIC All codes for a specific measurement are concatenated in a single column. Codes have to be separated into different columns so that the dataset can be grouped by country or education level. Preparation includes assigning a new identifier to each measurement and turning the concatenated codes into an array.
-
-// COMMAND ----------
-
-val splitCols = split(educationInitialDF("indic_ur,cities\time"), ",")
-val educationSplitDF = educationInitialDF.withColumn("InfoArray", splitCols)
-val genericWindow = Window.orderBy(lit(1))
-val educationRowDF = educationSplitDF.withColumn("row_id", row_number().over(genericWindow))
-display(educationRowDF)
-
-// COMMAND ----------
-
-// MAGIC %md
-// MAGIC Separate the codes into separate columns. We explode the array using posexplode so that information about a code's position in the array is retained. Then we use this retained position to create a column name and to fetch the value of the code from the array. Then we pivot the dataframe to turn the code and column name rows into columns.
-
-// COMMAND ----------
-
-val educationDesignationDF = educationRowDF.select(educationRowDF("row_id").alias("id"), educationRowDF("InfoArray"), posexplode(educationRowDF("InfoArray"))).drop("col")
-val titledCodesDF = educationDesignationDF.select(educationDesignationDF("id"),
-                                                      concat(lit("code"), educationDesignationDF("pos").cast("string"))
-                                                             .alias("col_names"),
-                                                     expr("InfoArray[pos]").alias("code"))
-val pivotedCodesDF = titledCodesDF.groupBy("id").pivot("col_names").agg(first("code"))
-display(pivotedCodesDF)
-
-// COMMAND ----------
-
-// MAGIC %md
-// MAGIC Merge the newly-created code columns with the rest of the education level dataset and remove unnecessary columns.
-
-// COMMAND ----------
-
-val educationCodesDF = educationRowDF.join(pivotedCodesDF, educationRowDF("row_id") === pivotedCodesDF("id"), "inner")
-val educationCleanDF = educationCodesDF.drop("indic_ur,cities\time").drop(educationCodesDF("InfoArray")).drop(educationCodesDF("id"))
+val educationCleanDF = educationNumbersDF
 display(educationCleanDF)
 
 // COMMAND ----------
 
 // MAGIC %md
-// MAGIC Map codes to the descriptions provided by the XML file.
+// MAGIC Split codes into separate columns.
 
 // COMMAND ----------
 
-var educationTranslatedDF = educationCleanDF
-for (i <- Range(0, 5, 1)) {
-  for ((code, entity) <- educationMap) {
-    val column = "code" + i.toString
-    educationTranslatedDF = educationTranslatedDF.withColumn(column, regexp_replace(educationTranslatedDF(column), "^" + code + "$", entity))
+// MAGIC %md
+// MAGIC First, assign a unique identifier to each column with a different combination of codes.
+
+// COMMAND ----------
+
+val genericWindow = Window.orderBy(lit(1))
+val educationRowDF = educationCleanDF.withColumn("row_id", row_number().over(genericWindow))
+display(educationRowDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Second, explode the array of codes while retaining information about where the code was in the array (posexplode). Form temporary column names for each code type. Then pivot.
+
+// COMMAND ----------
+
+val educationDesignationDF = educationRowDF.select(educationRowDF("row_id").alias("id"), educationRowDF("codes"), posexplode(educationRowDF("codes"))).drop("col")
+val translatedCodesDF = educationDesignationDF.select(educationDesignationDF("id"),
+                                                      concat(lit("code"), educationDesignationDF("pos").cast("string"))
+                                                             .alias("col_names"),
+                                                     expr("codes[pos]").alias("code"))
+val pivotedCodesDF = translatedCodesDF.groupBy("id").pivot("col_names").agg(first("code"))
+display(pivotedCodesDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Lastly, join the newly formed dataframe with separate columns to the old dataframe using the unique identifier. Rename columns to reflect code type.
+
+// COMMAND ----------
+
+val educationCodesDF = educationRowDF.join(pivotedCodesDF, educationRowDF("row_id") === pivotedCodesDF("id"), "inner")
+val educationSeparateDF = educationCodesDF.drop(educationCodesDF("codes")).drop(educationCodesDF("id"))
+// unit,sex,isced11,citizen,age,geo
+val educationRenamedDF = educationSeparateDF.withColumnRenamed("code0", "Unit").withColumnRenamed("code1", "Sex").withColumnRenamed("code2", "ISCED11").withColumnRenamed("code3", "Citizen")
+                        .withColumnRenamed("code4", "Age").withColumnRenamed("code5", "Country").drop("row_id")
+display(educationRenamedDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Extract codes from EU education attainment XML structure file and map them to descriptions in English.
+
+// COMMAND ----------
+
+val educationStructureFile = "dbfs:/FileStore/edat_lfs_9911_dsd.xml"
+val educationMap = getCodeMap(educationStructureFile, "en")
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Translate codes to descriptions in education attainment dataset.
+
+// COMMAND ----------
+
+val codeNames = Array("Unit", "Sex", "ISCED11", "Citizen", "Age", "Country")
+var educationTranslatedDF = educationRenamedDF
+
+for ((code, description) <- educationMap) {
+  for (codeColumn <- codeNames) {
+    educationTranslatedDF = educationTranslatedDF.withColumn(codeColumn, regexp_replace(educationTranslatedDF(codeColumn), "^" + code + "$", description))
   }
 }
-educationTranslatedDF.cache()
 
 display(educationTranslatedDF)
 
 // COMMAND ----------
 
 // MAGIC %md
-// MAGIC Establish which information is needed. Code 2 specifies education level and code 4 specifies country (and EU subtotals).
+// MAGIC Check for rogue values.
 
 // COMMAND ----------
 
-val code0DF = educationTranslatedDF.select(educationTranslatedDF("code0")).distinct()
-display(code0DF)
-
-// COMMAND ----------
-
-val code1DF = educationTranslatedDF.select(educationTranslatedDF("code1")).distinct()
-display(code1DF)
-
-// COMMAND ----------
-
-val code2DF = educationTranslatedDF.select(educationTranslatedDF("code2")).distinct()
-display(code2DF)
-
-// COMMAND ----------
-
-val code3DF = educationTranslatedDF.select(educationTranslatedDF("code3")).distinct()
-display(code3DF)
-
-// COMMAND ----------
-
-val code4DF = educationTranslatedDF.select(educationTranslatedDF("code4")).distinct()
-display(code4DF)
+for (codeColumn <- codeNames) {
+  educationTranslatedDF.select(codeColumn).distinct().show(false)
+}
 
 // COMMAND ----------
 
 // MAGIC %md
-// MAGIC Rename columns and drop unnecessary rows. Filter code 3 so that we only have totals and create a separate dataframe for EU subtotals.
+// MAGIC Clean once more - remove unnecessary code columns and shorten others.
 
 // COMMAND ----------
 
-val educationRenamedDF = educationTranslatedDF.withColumnRenamed("code4", "Country").withColumnRenamed("code2", "Education_Level").withColumnRenamed("code3", "Sex").withColumnRenamed("code1", "ISCEDF13").drop("code0")
-val educationNoGenderDF = educationRenamedDF.filter(educationRenamedDF("Sex") =!= "Total").drop("Sex")
+/*val educationAttainment = Array("Less than primary, primary and lower secondary education (levels 0-2)", 
+                               "Upper secondary, post-secondary non-tertiary and tertiary education (levels 3-8)",
+                               "Upper secondary and post-secondary non-tertiary education (levels 3 and 4)")
 
-val educationNoEuroDF = educationNoGenderDF.filter(!educationNoGenderDF("Country").contains("Euro"))
-val educationOnlyEuroDF = educationNoGenderDF.filter(educationNoGenderDF("Country").contains("Euro"))
-display(educationNoEuroDF)
+val ages = Array("From 15 to 24 years", "From 15 to 64 years", "From 15 to 69 years", "From 15 to 74 years", "From 18 to 24 years", "From 18 to 64 years", "From 18 to 69 years",
+                "From 18 to 74 years", "From 20 to 24 years", "From 25 to 34 years", "From 25 to 54 years", "From 25 to 64 years", "From 25 to 69 years", "From 25 to 74 years",
+                "From 30 to 34 years", "From 55 to 74 years")*/
+
+val educationAttainment = educationTranslatedDF.select("ISCED11").distinct().collect().map(row => row(0).toString)
+val ages = educationTranslatedDF.select("Age").distinct().collect().map(row => row(0).toString)
+
+val educationAttainmentSub = Array("Secondary", "Tertiary", "Vocational")
+val agesSub = Array("15-24", "15-64", "15-69", "15-74", "18-24", "18-64", "18-69", "18-74", "20-24", "25-34", "25-54", "25-64", "25-69", "25-74", "30-34", "55-74")
+
+val educationAttainmentMap = educationAttainment zip educationAttainmentSub
+val agesMap = ages zip agesSub
+
+var educationOpaqueDF = educationTranslatedDF.drop("Unit").drop("Sex").filter(educationTranslatedDF("Citizen") === "Total").drop("Citizen").withColumnRenamed("ISCED11", "Education_Attainment")
+for((original, sub) <- euroMap) {
+  educationOpaqueDF = educationOpaqueDF.withColumn("Country", regexp_replace(educationOpaqueDF("Country"), "\\Q" + original + "\\E", sub))
+}
+for((original, sub) <- educationAttainmentMap) {
+  educationOpaqueDF = educationOpaqueDF.withColumn("Education_Attainment", regexp_replace(educationOpaqueDF("Education_Attainment"), "\\Q" + original + "\\E", sub))
+}
+for((original, sub) <- agesMap) {
+  educationOpaqueDF = educationOpaqueDF.withColumn("Age", regexp_replace(educationOpaqueDF("Age"), original, sub))
+}
+val educationShortDF = educationOpaqueDF
+
+display(educationShortDF)
 
 // COMMAND ----------
 
-val educationYears = Range(2012, 2020, 1)
-val educationYearDF = educationNoGenderDF.select(educationNoGenderDF("row_id"), map(educationYears.map(year => lit(year.toString) :: col(year.toString) :: Nil).flatten: _*).alias("year_map"))
-val educationPartitionedDF = educationYearDF.select(educationYearDF("row_id"), explode(educationYearDF("year_map").alias("year", "num-")))
-display(educationPartitionedDF)
+// MAGIC %md
+// MAGIC Separate measurements by year.
+
+// COMMAND ----------
+
+var educationMapDF = educationShortDF.withColumn("year_map", map(educationYears.map(year => lit(year.toString) :: educationShortDF(year.toString) :: Nil).flatten: _*))
+
+for (i <- educationYears) {
+  educationMapDF = educationMapDF.drop(i.toString)
+}
+
+educationMapDF = educationMapDF.select(educationMapDF("*"), explode(educationMapDF("year_map")))
+educationMapDF = educationMapDF.withColumnRenamed("key", "Year").withColumnRenamed("value", "Proportion").drop("year_map")
+educationMapDF = educationMapDF.withColumn("Year", educationMapDF("Year").cast(IntegerType))
+educationMapDF.cache()
+
+display(educationMapDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Move education attainment proportions to columns and separate into younger, middle-aged and older proportions.
+
+// COMMAND ----------
+
+val educationGlobalDF = educationMapDF.filter(educationMapDF("Age") === "18-74")
+.groupBy("Country", "Year").pivot("Education_Attainment").sum("Proportion")
+
+val educationYoungDF = educationMapDF.filter(educationMapDF("Age") === "18-24" || educationMapDF("Age") === "25-34")
+.groupBy("Country", "Year").pivot("Education_Attainment").sum("Proportion")
+
+val educationMiddleDF = educationMapDF.filter(educationMapDF("Age") === "25-54")
+.groupBy("Country", "Year").pivot("Education_Attainment").sum("Proportion")
+
+val educationOldDF = educationMapDF.filter(educationMapDF("Age") === "55-74")
+.groupBy("Country", "Year").pivot("Education_Attainment").sum("Proportion")
+
+display(educationGlobalDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Join datasets.
+
+// COMMAND ----------
+
+val joinedCols = List("Country", "Year")
+val globalJoinedDF = natalityMapDF.join(educationGlobalDF, joinedCols)
+val youngJoinedDF = natalityMapDF.join(educationYoungDF, joinedCols)
+val middleJoinedDF = natalityMapDF.join(educationMiddleDF, joinedCols)
+val oldJoinedDF = natalityMapDF.join(educationOldDF, joinedCols)
+display (globalJoinedDF)
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Save data to files.
+
+// COMMAND ----------
+
+val data_path = "dbfs:/FileStore/temp/analysis/"
+globalJoinedDF.write.option("header", true).mode("overwrite").csv(data_path + "joined-global")
+youngJoinedDF.write.option("header", true).mode("overwrite").csv(data_path + "joined-young")
+middleJoinedDF.write.option("header", true).mode("overwrite").csv(data_path + "joined-middle-age")
+oldJoinedDF.write.option("header", true).mode("overwrite").csv(data_path + "joined-old")
+natalityMapDF.write.option("header", true).mode("overwrite").csv(data_path + "natality")
+educationGlobalDF.write.option("header", true).mode("overwrite").csv(data_path + "education-global")
+educationYoungDF.write.option("header", true).mode("overwrite").csv(data_path + "education-young")
+educationMiddleDF.write.option("header", true).mode("overwrite").csv(data_path + "education-middle-age")
+educationOldDF.write.option("header", true).mode("overwrite").csv(data_path + "education-old")
+
+// COMMAND ----------
+
+// MAGIC %md
+// MAGIC Repartition education dataset for streaming.
+
+// COMMAND ----------
+
+val stream_path = "dbfs:/FileStore/temp/stream"
+val educationStringDF = educationMapDF.withColumn("Year", educationMapDF("Year").cast(StringType))
+val educationYearDF = educationStringDF.withColumn("Year", to_timestamp(educationStringDF("Year").cast(TimestampType)))
+
+educationYearDF.write.partitionBy("Year").option("header", true).mode("overwrite").csv(stream_path)
+
+display(educationYearDF)
